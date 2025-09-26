@@ -215,7 +215,7 @@ def train(opt):
     print("Initnializing Model...")
 
     # 模型初始化
-    model = MyModel(in_c=8, use_enhanced_fusion=True)
+    model = MyModel(in_c=8)
 
     # 优化模型
     # max-autotune最快但耗时，reduce-overhead适合加速小模型，需要额外存储空间，deffault适合大模型不需要额外存储空间
