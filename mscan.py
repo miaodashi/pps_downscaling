@@ -467,119 +467,6 @@ class MSCAN(BaseModule):
         return outs
 
 
-class EnhancedMultiScaleFusion(BaseModule):
-    """增强型多尺度特征融合模块
-    
-    通过注意力机制、残差连接和多路径融合策略，更有效地融合多尺度特征
-    
-    Args:
-        in_channels_list (list[int]): 输入特征图的通道数列表
-        out_channels (int): 输出特征图的通道数
-        scales (list[int]): 各特征图的下采样倍数
-    """
-    
-    def __init__(self, 
-                 in_channels_list=[64, 128, 256, 512], 
-                 out_channels=256,
-                 scales=[4, 8, 16, 32]):
-        super().__init__()
-        
-        self.scales = scales
-        self.in_channels_list = in_channels_list
-        self.out_channels = out_channels
-        
-        # 1. 特征转换层 - 将不同通道数的特征统一到相同维度
-        self.transform_layers = nn.ModuleList()
-        for in_channels in in_channels_list:
-            self.transform_layers.append(
-                nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, 1),
-                    nn.BatchNorm2d(out_channels),
-                    nn.ReLU(inplace=True)
-                )
-            )
-        
-        # 2. 上采样层 - 将不同分辨率的特征上采样到相同大小
-        self.upsample_layers = nn.ModuleList()
-        for scale in scales:
-            self.upsample_layers.append(
-                nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False)
-            )
-        
-        # 3. 通道注意力机制 - 学习不同特征的重要性权重
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels * len(in_channels_list), out_channels * len(in_channels_list) // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels * len(in_channels_list) // 4, out_channels * len(in_channels_list), 1),
-            nn.Sigmoid()
-        )
-        
-        # 4. 特征融合模块 - 自适应融合多尺度特征
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(out_channels * len(in_channels_list), out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 5. 细化模块 - 进一步优化融合特征
-        self.refinement = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels)
-        )
-        
-        # 6. 残差连接 - 保留原始特征信息
-        self.residual_proj = nn.Conv2d(out_channels * len(in_channels_list), out_channels, 1)
-        
-        # 7. 最终激活
-        self.final_act = nn.ReLU(inplace=True)
-    
-    def forward(self, features):
-        """前向传播
-        
-        Args:
-            features (list[Tensor]): 多尺度特征图列表
-            
-        Returns:
-            Tensor: 融合后的特征图 [B, out_channels, H, W]
-        """
-        assert len(features) == len(self.transform_layers) == len(self.upsample_layers)
-        
-        # 1. 特征转换和上采样
-        transformed_features = []
-        for i, feat in enumerate(features):
-            # 转换通道数
-            feat = self.transform_layers[i](feat)
-            # 上采样到统一分辨率
-            feat = self.upsample_layers[i](feat)
-            transformed_features.append(feat)
-        
-        # 2. 特征拼接
-        concat_features = torch.cat(transformed_features, dim=1)
-        
-        # 3. 通道注意力加权
-        attention_weights = self.channel_attention(concat_features)
-        weighted_features = concat_features * attention_weights
-        
-        # 4. 残差连接
-        residual = self.residual_proj(concat_features)
-        
-        # 5. 特征融合
-        fused_features = self.fusion_conv(weighted_features)
-        
-        # 6. 特征细化
-        refined_features = self.refinement(fused_features)
-        
-        # 7. 残差连接
-        output = self.final_act(refined_features + residual)
-        
-        return output
-
-
-# 保留原始模块以兼容现有代码
 class MultiScaleFusionModule(BaseModule):
     """多尺度特征融合模块
     
@@ -662,7 +549,7 @@ class MCA_STM(nn.Module):
         in_c (int): 输入通道数
         use_enhanced_fusion (bool): 是否使用增强型融合模块
     """
-    def __init__(self, in_c: int, use_enhanced_fusion: bool = True) -> None:
+    def __init__(self, in_c: int) -> None:
         super().__init__()
         # 移除未使用的卷积层
         self.backbone = MSCAN(
@@ -677,19 +564,12 @@ class MCA_STM(nn.Module):
             norm_cfg=dict(type='SyncBN', requires_grad=True)
         )
         
-        # 选择融合模块类型
-        if use_enhanced_fusion:
-            self.fusion = EnhancedMultiScaleFusion(
-                in_channels_list=[64, 128, 256, 512], 
-                out_channels=256, 
-                scales=[4, 8, 16, 32]
-            )
-        else:
-            self.fusion = MultiScaleFusionModule(
-                in_channels_list=[64, 128, 256, 512], 
-                out_channels=256, 
-                scales=[4, 8, 16, 32]
-            )
+    
+        self.fusion = MultiScaleFusionModule(
+            in_channels_list=[64, 128, 256, 512], 
+            out_channels=256, 
+            scales=[4, 8, 16, 32]
+        )
             
         # 回归模块
         self.regression = MultiModalRegression(256)
@@ -717,7 +597,7 @@ class MCA_STM(nn.Module):
 if __name__ == "__main__":
     # 测试两种融合模块
     print("=== 测试增强型融合模块 ===")
-    model_enhanced = MCA_STM(in_c=8, use_enhanced_fusion=True)
+    model_enhanced = MCA_STM(in_c=8)
     x = torch.randn(16, 8, 64, 64)
     out_enhanced = model_enhanced(x)
     print(f"输入形状: {x.shape}")
