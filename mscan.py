@@ -6,6 +6,7 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv.cnn import build_activation_layer, build_norm_layer
 from mmcv.cnn.bricks import DropPath
 from mmengine.model import BaseModule
@@ -467,42 +468,220 @@ class MSCAN(BaseModule):
         return outs
 
 
-class MultiScaleFusionModule(BaseModule):
-    """多尺度特征融合模块
+class MultiScaleChannelAttention(BaseModule):
+    """多尺度通道注意力模块
     
-    将MSCAN输出的多尺度特征进行融合，生成统一分辨率的特征图
+    通过在不同空间尺度上计算通道注意力，更好地捕获通道间的重要性关系
+    
+    Args:
+        channels (int): 输入通道数
+        scales (list): 多尺度池化的尺度列表，默认[1, 3, 5, 7]
+        reduction (int): 通道压缩比例，默认4
+        use_global (bool): 是否使用全局上下文增强，默认True
+        activation (str): 激活函数类型，默认'ReLU'
+    """
+    
+    def __init__(self, 
+                 channels, 
+                 scales=[1, 3, 5, 7], 
+                 reduction=4, 
+                 use_global=True,
+                 activation='ReLU'):
+        super(MultiScaleChannelAttention, self).__init__()
+        
+        self.channels = channels
+        self.scales = scales
+        self.reduction = reduction
+        self.use_global = use_global
+        
+        # 多尺度池化分支
+        self.multi_scale_pools = nn.ModuleList()
+        for scale in scales:
+            if scale == 1:
+                # 全局平均池化
+                self.multi_scale_pools.append(nn.AdaptiveAvgPool2d(1))
+            else:
+                # 多尺度平均池化
+                self.multi_scale_pools.append(nn.AdaptiveAvgPool2d(scale))
+        
+        # 特征变换层
+        hidden_channels = max(channels // reduction, 8)  # 确保最小通道数
+        
+        # 每个尺度的特征变换
+        self.scale_transforms = nn.ModuleList()
+        for _ in scales:
+            self.scale_transforms.append(
+                nn.Sequential(
+                    nn.Conv2d(channels, hidden_channels, 1, bias=False),
+                    nn.BatchNorm2d(hidden_channels),
+                    self._get_activation(activation)
+                )
+            )
+        
+        # 尺度融合网络
+        total_hidden_channels = hidden_channels * len(scales)
+        self.scale_fusion = nn.Sequential(
+            nn.Conv2d(total_hidden_channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            self._get_activation(activation),
+            nn.Conv2d(hidden_channels, channels, 1, bias=False),
+        )
+        
+        # 全局上下文分支（可选）
+        if use_global:
+            self.global_context = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // reduction, 1, bias=False),
+                self._get_activation(activation),
+                nn.Conv2d(channels // reduction, channels, 1, bias=False),
+            )
+        
+        # 最终激活
+        self.sigmoid = nn.Sigmoid()
+        
+        # 可学习的尺度权重
+        self.scale_weights = nn.Parameter(torch.ones(len(scales)))
+        
+        self._init_weights()
+    
+    def _get_activation(self, activation):
+        """获取激活函数"""
+        if activation == 'ReLU':
+            return nn.ReLU(inplace=True)
+        elif activation == 'GELU':
+            return nn.GELU()
+        elif activation == 'SiLU':
+            return nn.SiLU(inplace=True)
+        else:
+            return nn.ReLU(inplace=True)
+    
+    def _init_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        """前向传播
+        
+        Args:
+            x (Tensor): 输入特征图 [B, C, H, W]
+            
+        Returns:
+            Tensor: 注意力权重 [B, C, 1, 1]
+        """
+        B, C, H, W = x.size()
+        
+        # 1. 多尺度特征提取
+        scale_features = []
+        scale_weights_norm = F.softmax(self.scale_weights, dim=0)
+        
+        for i, (pool, transform) in enumerate(zip(self.multi_scale_pools, self.scale_transforms)):
+            # 多尺度池化
+            pooled = pool(x)  # [B, C, scale, scale] or [B, C, 1, 1]
+            
+            # 特征变换
+            transformed = transform(pooled)  # [B, hidden_channels, scale, scale]
+            
+            # 上采样到统一尺寸 (1x1)
+            if transformed.size(2) != 1 or transformed.size(3) != 1:
+                transformed = F.adaptive_avg_pool2d(transformed, 1)
+            
+            # 应用可学习的尺度权重
+            transformed = transformed * scale_weights_norm[i]
+            scale_features.append(transformed)
+        
+        # 2. 多尺度特征融合
+        fused_features = torch.cat(scale_features, dim=1)  # [B, total_hidden_channels, 1, 1]
+        attention = self.scale_fusion(fused_features)  # [B, C, 1, 1]
+        
+        # 3. 全局上下文增强（可选）
+        if self.use_global:
+            global_att = self.global_context(x)
+            attention = attention + global_att
+        
+        # 4. 生成最终注意力权重
+        attention_weights = self.sigmoid(attention)
+        
+        return attention_weights
+
+
+class MultiScaleFusionModule(BaseModule):
+    """增强型多尺度特征融合模块
+    
+    将MSCAN输出的多尺度特征进行融合，并集成多尺度通道注意力机制
     
     Args:
         in_channels_list (list[int]): 输入特征图的通道数列表
         out_channels (int): 输出特征图的通道数
         scales (list[int]): 各特征图的下采样倍数
+        attention_scales (list[int]): 通道注意力的多尺度池化尺度
+        use_attention (bool): 是否使用多尺度通道注意力
     """
     
     def __init__(self, 
                  in_channels_list=[64, 128, 256, 512], 
                  out_channels=256,
-                 scales=[4, 8, 16, 32]):
+                 scales=[4, 8, 16, 32],
+                 attention_scales=[1, 3, 5, 7],
+                 use_attention=True):
         super().__init__()
         
         self.scales = scales
+        self.use_attention = use_attention
         
-        # 上采样卷积层
-        self.upsample_layers = nn.ModuleList()
-        for i, in_channels in enumerate(in_channels_list):
-            self.upsample_layers.append(
+        # 1. 特征转换层 - 将不同通道数转换为统一通道数
+        self.transform_layers = nn.ModuleList()
+        for in_channels in in_channels_list:
+            self.transform_layers.append(
                 nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, 1),
-                    nn.Upsample(scale_factor=scales[i], mode='bilinear', align_corners=False)
+                    nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True)
                 )
             )
         
-        # 特征融合卷积
+        # 2. 上采样层 - 将不同分辨率的特征上采样到相同大小
+        self.upsample_layers = nn.ModuleList()
+        for scale in scales:
+            self.upsample_layers.append(
+                nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False)
+            )
+        
+        # 3. 多尺度通道注意力机制 - 学习不同特征的重要性权重
+        if use_attention:
+            self.channel_attention = MultiScaleChannelAttention(
+                channels=out_channels * len(in_channels_list),
+                scales=attention_scales,
+                reduction=4,
+                use_global=True,
+                activation='ReLU'
+            )
+        
+        # 4. 特征融合模块 - 自适应融合多尺度特征
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(out_channels * len(in_channels_list), out_channels, 3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1)
+            nn.ReLU(inplace=True)
         )
+        
+        # 5. 细化模块 - 进一步优化融合特征
+        self.refinement = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels)
+        )
+        
+        # 6. 残差连接 - 保留原始特征信息
+        self.residual_proj = nn.Conv2d(out_channels * len(in_channels_list), out_channels, 1)
+        
+        # 7. 最终激活
+        self.final_act = nn.ReLU(inplace=True)
     
     def forward(self, features):
         """前向传播
@@ -513,19 +692,38 @@ class MultiScaleFusionModule(BaseModule):
         Returns:
             Tensor: 融合后的特征图 [B, out_channels, H, W]
         """
-        assert len(features) == len(self.upsample_layers)
+        assert len(features) == len(self.transform_layers) == len(self.upsample_layers)
         
-        # 上采样所有特征到同一分辨率
-        upsampled_features = []
+        # 1. 特征转换和上采样
+        transformed_features = []
         for i, feat in enumerate(features):
-            up_feat = self.upsample_layers[i](feat)
-            upsampled_features.append(up_feat)
+            # 转换通道数
+            feat = self.transform_layers[i](feat)
+            # 上采样到统一分辨率
+            feat = self.upsample_layers[i](feat)
+            transformed_features.append(feat)
         
-        # 拼接所有特征
-        fused = torch.cat(upsampled_features, dim=1)
+        # 2. 特征拼接
+        concat_features = torch.cat(transformed_features, dim=1)
         
-        # 融合特征
-        output = self.fusion_conv(fused)
+        # 3. 多尺度通道注意力加权
+        if self.use_attention:
+            attention_weights = self.channel_attention(concat_features)
+            weighted_features = concat_features * attention_weights
+        else:
+            weighted_features = concat_features
+        
+        # 4. 残差连接
+        residual = self.residual_proj(concat_features)
+        
+        # 5. 特征融合
+        fused_features = self.fusion_conv(weighted_features)
+        
+        # 6. 特征细化
+        refined_features = self.refinement(fused_features)
+        
+        # 7. 残差连接
+        output = self.final_act(refined_features + residual)
         
         return output
 
@@ -565,10 +763,13 @@ class MCA_STM(nn.Module):
         )
         
     
+        # 增强型多尺度特征融合模块（集成多尺度通道注意力）
         self.fusion = MultiScaleFusionModule(
             in_channels_list=[64, 128, 256, 512], 
             out_channels=256, 
-            scales=[4, 8, 16, 32]
+            scales=[4, 8, 16, 32],
+            attention_scales=[1, 3, 5, 7],  # 多尺度通道注意力的池化尺度
+            use_attention=True  # 启用多尺度通道注意力
         )
             
         # 回归模块
@@ -595,15 +796,40 @@ class MCA_STM(nn.Module):
         return output
 
 if __name__ == "__main__":
-    # 测试两种融合模块
-    print("=== 测试增强型融合模块 ===")
-    model_enhanced = MCA_STM(in_c=8)
-    x = torch.randn(16, 8, 64, 64)
-    out_enhanced = model_enhanced(x)
-    print(f"输入形状: {x.shape}")
-    print(f"输出形状: {out_enhanced.shape}")
+    # 测试集成多尺度通道注意力的模型
+    print("=== 测试集成多尺度通道注意力的MCA_STM模型 ===")
     
-    # print("\n=== 测试原始融合模块 ===")
-    # model_original = MCA_STM(in_c=8, use_enhanced_fusion=False)
-    # out_original = model_original(x)
-    # print(f"输出形状: {out_original.shape}")
+    # 创建模型
+    model = MCA_STM(in_c=8)
+    
+    # 测试输入
+    x = torch.randn(2, 8, 64, 64)  # 减小batch size以节省内存
+    
+    print(f"输入形状: {x.shape}")
+    print(f"模型参数数量: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 前向传播测试
+    with torch.no_grad():
+        output = model(x)
+        print(f"输出形状: {output.shape}")
+    
+    # 测试多尺度通道注意力模块
+    print("\n=== 测试多尺度通道注意力模块 ===")
+    attention_module = MultiScaleChannelAttention(
+        channels=1024,  # 4个特征图拼接后的通道数 (256*4)
+        scales=[1, 3, 5, 7],
+        reduction=4
+    )
+    
+    test_input = torch.randn(2, 1024, 16, 16)
+    attention_weights = attention_module(test_input)
+    print(f"注意力输入形状: {test_input.shape}")
+    print(f"注意力权重形状: {attention_weights.shape}")
+    print(f"注意力权重范围: [{attention_weights.min():.4f}, {attention_weights.max():.4f}]")
+    
+    print("\n=== 多尺度通道注意力集成成功! ===")
+    print("主要创新点:")
+    print("1. 多尺度池化 (1x1, 3x3, 5x5, 7x7) 捕获不同感受野的通道重要性")
+    print("2. 可学习的尺度权重自适应调节各尺度贡献")
+    print("3. 全局上下文增强保留重要的全局信息")
+    print("4. 残差连接和特征细化提升融合效果")
