@@ -52,6 +52,8 @@ def stack_tif_files(input_dir, output_file):
     
     # 为每个输出波段设置描述（使用输入文件名）
     for i, tif_file in enumerate(tqdm(tif_files, desc="叠加TIF文件")):
+
+        print(tif_file)
         # 读取当前文件
         src_ds = gdal.Open(tif_file, gdal.GA_ReadOnly)
         if src_ds is None:

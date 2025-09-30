@@ -489,9 +489,7 @@ class MCA_STM(nn.Module):
 
 
         
-        
-        # 回归模块
-        self.regression = MultiModalRegression(256)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 特征提取
